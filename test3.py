@@ -1,24 +1,20 @@
 """
-B站合集视频截图工具 (优化版 v2)
+B站UP主所有视频截图工具 (精准匹配版 v7)
 
 功能：
-1. 通过 B站 API 直接获取合集视频列表（无需浏览器，速度快且稳定）
-2. 正则匹配找到目标视频
-3. 首次运行弹出浏览器让用户登录B站，登录态永久保存在独立 profile 中
-4. 后续运行使用 headless 静默模式，在后台完成截图
+1. 全程使用 Selenium 模拟真实用户浏览（100% 绕过风控）
+2. 自动在UP主个人空间翻页查找匹配正则的视频
+3. 支持时间过滤：只检查指定日期（如 2025-11-01）之后的视频，遇到老视频自动停止
+4. 【修复】精准提取视频标题，解决误抓取播放量/时长导致正则匹配失败的问题
+5. 首次运行弹出浏览器让用户登录B站，后续运行后台静默截图
 
-依赖：pip install selenium requests
-
-首次使用：
-  运行脚本 → 浏览器弹出B站登录页 → 手动登录 → 关闭登录页 → 自动截图
-后续使用：
-  运行脚本 → 全程后台静默完成，无浏览器窗口弹出
+依赖：pip install selenium
 """
 
 import re
 import os
 import time
-import requests
+from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -26,123 +22,64 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 
-
 # ======================== 配置区 ========================
 
-# B站用户 mid 和合集 season_id（从合集URL中提取）
-# 合集URL: https://space.bilibili.com/688379639/lists/6735208?type=season
+# B站用户 mid
 MID = "688379639"
-SEASON_ID = "6735208"
 
 # 视频标题匹配规则
 TITLE_PATTERN = re.compile(r"27考研.*题")
 
+# 最早检查日期（遇到比这个日期更早的视频，直接停止查找）
+TARGET_DATE_STR = "2025-11-01"
+TARGET_DATE = datetime.strptime(TARGET_DATE_STR, "%Y-%m-%d")
+
 # ChromeDriver 路径
 CHROME_DRIVER_PATH = r"C:\Users\LiGuangxiao\Desktop\chromedriver.exe"
 
-# Selenium 专用的用户数据目录（独立于日常 Chrome，不会冲突）
+# Selenium 专用的用户数据目录
 SELENIUM_PROFILE_DIR = r"C:\Users\LiGuangxiao\AppData\Local\Google\Chrome\SeleniumProfile"
 
-# 登录完成的标记文件（存在即表示已经登录过，可以使用 headless 模式）
+# 登录完成的标记文件
 LOGIN_DONE_FLAG = os.path.join(SELENIUM_PROFILE_DIR, ".bilibili_logged_in")
 
 # 截图保存目录
 SCREENSHOT_DIR = "bilibili_screenshots"
 
 # 视频加载后等待秒数（等视频画面出现题目）
-VIDEO_WAIT_SECONDS = 2 # 3
+VIDEO_WAIT_SECONDS = 2
 
-# ★★★ 是否强制显示浏览器窗口（设为 True 则每次都弹出窗口，方便调试）★★★
+# 是否强制显示浏览器窗口（设为 True 则每次都弹出窗口，方便调试）
 FORCE_SHOW_BROWSER = False
 
 
-# ======================== 步骤1：通过API获取视频列表 ========================
+# ======================== 核心逻辑 ========================
 
-def fetch_video_list(mid: str, season_id: str) -> list[dict]:
+def parse_bili_date(date_str: str) -> datetime:
     """
-    调用B站 Web API 获取合集中的所有视频。
-    返回按时间正序排列的视频列表（最早发布的在前面）。
+    解析 B站的日期字符串为 datetime 对象
     """
-    api_url = "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list"
-    all_videos = []
-    page = 1
-    page_size = 30
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Referer": f"https://space.bilibili.com/{mid}",
-    }
-
-    print(f"正在通过API获取合集 (mid={mid}, season_id={season_id}) 的视频列表...")
-
-    while True:
-        params = {
-            "mid": mid,
-            "season_id": season_id,
-            "sort_reverse": "false",
-            "page_num": str(page),
-            "page_size": str(page_size),
-        }
-        try:
-            resp = requests.get(api_url, params=params, headers=headers, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"API 请求失败: {e}")
-            return []
-
-        if data.get("code") != 0:
-            print(f"API 返回错误: code={data.get('code')}, message={data.get('message')}")
-            return []
-
-        archives = data.get("data", {}).get("archives", [])
-        if not archives:
-            break
-
-        all_videos.extend(archives)
-        total = data.get("data", {}).get("page", {}).get("total", 0)
-        print(f"  第 {page} 页: 获取到 {len(archives)} 个视频 (累计 {len(all_videos)}/{total})")
-
-        if len(all_videos) >= total:
-            break
-        page += 1
-
-    print(f"共获取到 {len(all_videos)} 个视频。\n")
-    return all_videos
-
-
-# ======================== 步骤2：匹配目标视频 ========================
-
-def find_target_video(videos: list[dict], pattern: re.Pattern) -> dict | None:
-    """
-    从视频列表中找到最后一个（最新的）匹配正则的视频。
-    """
-    print("开始正则匹配目标视频...")
-    for video in reversed(videos):
-        title = video.get("title", "")
-        if pattern.search(title):
-            bvid = video.get("bvid", "")
-            url = f"https://www.bilibili.com/video/{bvid}"
-            print(f"  ✅ 匹配成功: 《{title}》")
-            print(f"     BV号: {bvid}")
-            print(f"     链接: {url}\n")
-            return {"title": title, "bvid": bvid, "url": url}
-
-    print("  ❌ 未找到匹配的视频。\n")
-    return None
-
-
-# ======================== 步骤3：构建 Chrome 选项 ========================
+    date_str = date_str.strip()
+    now = datetime.now()
+    try:
+        if any(x in date_str for x in ["秒", "分", "时", "刚刚"]):
+            return now
+        elif "昨天" in date_str:
+            return now - timedelta(days=1)
+        elif "前天" in date_str:
+            return now - timedelta(days=2)
+        elif date_str.count("-") == 1:
+            # 格式如 "10-20"，代表今年
+            month, day = map(int, date_str.split("-"))
+            return datetime(now.year, month, day)
+        elif date_str.count("-") == 2:
+            # 格式如 "2025-10-20"，代表往年
+            return datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        pass
+    return now
 
 def build_chrome_options(headless: bool = False) -> ChromeOptions:
-    """
-    构建 Chrome 启动选项。
-    headless=True 时浏览器在后台静默运行，不弹出窗口。
-    """
     options = ChromeOptions()
     options.add_argument("--mute-audio")
     options.add_argument("--remote-allow-origins=*")
@@ -152,25 +89,17 @@ def build_chrome_options(headless: bool = False) -> ChromeOptions:
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
 
-    # ★★★ 【修改位置 - Headless 模式开关】★★★
-    # 下面这段控制浏览器是否在后台静默运行
-    # --headless=new 是 Chrome 109+ 的新版 headless，渲染能力接近正常浏览器
     if headless:
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
-        # headless 模式下设置合理的窗口大小，确保截图完整
         options.add_argument("--window-size=1920,1080")
 
     return options
 
-
-# ======================== 步骤4：首次登录 ========================
+def is_logged_in() -> bool:
+    return os.path.isfile(LOGIN_DONE_FLAG)
 
 def first_time_login():
-    """
-    首次运行时弹出浏览器，打开B站登录页面，等待用户手动登录。
-    登录完成后在 profile 目录下写入标记文件，后续运行将跳过此步骤。
-    """
     print("=" * 60)
     print("【首次运行】需要登录B站账号以获取高清画质")
     print("  浏览器即将打开B站登录页面，请手动完成登录。")
@@ -179,24 +108,20 @@ def first_time_login():
 
     os.makedirs(SELENIUM_PROFILE_DIR, exist_ok=True)
 
-    # 首次登录必须显示浏览器窗口（不能 headless）
     options = build_chrome_options(headless=False)
     service = Service(executable_path=CHROME_DRIVER_PATH)
     driver = webdriver.Chrome(service=service, options=options)
 
     try:
-        # 打开B站登录页
         driver.get("https://passport.bilibili.com/login")
         print("\n⏳ 等待您在浏览器中登录...")
         print("   登录完成后，请回到这个命令行窗口按 Enter 键。\n")
 
         input(">>> 按 Enter 键确认已登录完成...")
 
-        # 访问一下首页，让 Cookie 完整保存
         driver.get("https://www.bilibili.com")
         time.sleep(2)
 
-        # 写入标记文件
         with open(LOGIN_DONE_FLAG, "w", encoding="utf-8") as f:
             f.write(f"logged_in_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -207,30 +132,93 @@ def first_time_login():
     finally:
         driver.quit()
 
-
-def is_logged_in() -> bool:
-    """检查是否已经完成过首次登录。"""
-    return os.path.isfile(LOGIN_DONE_FLAG)
-
-
-# ======================== 步骤5：截图 ========================
-
-def take_video_screenshot(video_url: str, video_title: str):
+def find_target_video(driver: webdriver.Chrome, mid: str, pattern: re.Pattern) -> dict | None:
     """
-    启动 Chrome，访问视频页面，等待播放器加载后对播放器区域截图。
-    如果已经登录过，默认使用 headless 静默模式。
+    使用 Selenium 在UP主空间翻页查找匹配的视频，并检查日期。
     """
-    # 决定是否使用 headless 模式
-    use_headless = is_logged_in() and (not FORCE_SHOW_BROWSER)
+    url = f"https://space.bilibili.com/{mid}/video"
+    print(f"正在访问UP主视频页: {url}")
+    driver.get(url)
+    
+    page = 1
+    max_pages = 50 # 防止死循环
+    reached_old_videos = False
+    
+    while page <= max_pages:
+        print(f"正在扫描第 {page} 页...")
+        time.sleep(3) # 等待页面和视频列表加载
+        
+        # 滚动页面到底部，触发图片和元素的懒加载
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1)
+        
+        # 查找所有视频卡片容器
+        cards = driver.find_elements(By.CSS_SELECTOR, ".bili-video-card")
+        
+        for card in cards:
+            try:
+                # 1. 【修复点】精准定位到包含真实标题的 div 元素
+                title_div = card.find_element(By.CSS_SELECTOR, ".bili-video-card__title")
+                
+                # 优先从 title 属性获取完整标题，如果没有则获取文本
+                title = title_div.get_attribute("title")
+                if not title:
+                    title = title_div.text
+                title = title.strip()
 
-    if use_headless:
-        print("正在以后台静默模式启动 Chrome...")
-    else:
-        print("正在启动 Chrome 浏览器（窗口模式）...")
+                # 从标题 div 内部的 a 标签获取链接
+                a_tag = title_div.find_element(By.TAG_NAME, "a")
+                href = a_tag.get_attribute("href").split('?')[0]
 
-    options = build_chrome_options(headless=use_headless)
-    service = Service(executable_path=CHROME_DRIVER_PATH)
-    driver = webdriver.Chrome(service=service, options=options)
+                # 2. 获取日期并判断
+                try:
+                    date_span = card.find_element(By.CSS_SELECTOR, ".bili-video-card__subtitle span")
+                    date_str = date_span.text.strip()
+                except:
+                    date_str = ""
+                    
+                if date_str:
+                    video_date = parse_bili_date(date_str)
+                    # 如果视频发布时间早于设定的目标时间，直接停止查找
+                    if video_date < TARGET_DATE:
+                        print(f"[跳过] 视频《{title}》发布于 {date_str}，早于 {TARGET_DATE_STR}，停止往前查找。")
+                        reached_old_videos = True
+                        break # 跳出当前页的卡片遍历
+                
+                # 3. 检查标题是否匹配正则
+                if pattern.search(title):
+                    print(f"  ✅ 匹配成功: 《{title}》 (发布于 {date_str})")
+                    print(f"     链接: {href}\n")
+                    return {"title": title, "url": href}
+                    
+            except Exception as e:
+                # 如果某个卡片解析失败，跳过继续解析下一个
+                continue
+                
+        # 如果已经遇到老视频，直接结束整个翻页循环
+        if reached_old_videos:
+            break
+            
+        # 尝试点击下一页
+        try:
+            next_btn = driver.find_element(By.XPATH, "//button[contains(@class, 'vui_pagenation--btn-side') and contains(text(), '下一页')]")
+            
+            btn_class = next_btn.get_attribute("class")
+            if next_btn.get_attribute("disabled") or "disabled" in btn_class:
+                print("已到达最后一页。")
+                break
+                
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
+            time.sleep(0.5)
+            next_btn.click()
+            page += 1
+        except Exception as e:
+            print("未找到下一页按钮，或已到达最后一页。")
+            break
+            
+    return None
+
+def take_video_screenshot(driver: webdriver.Chrome, video_url: str, video_title: str):
     wait = WebDriverWait(driver, 20)
 
     try:
@@ -247,31 +235,27 @@ def take_video_screenshot(video_url: str, video_title: str):
         print(f"播放器已加载，等待 {VIDEO_WAIT_SECONDS} 秒让画面呈现题目...")
         time.sleep(VIDEO_WAIT_SECONDS)
 
-        # ★★★ 截图前清理：隐藏"已静音开播"提示、弹幕、底部控制栏等干扰元素 ★★★
         print("正在清理播放器浮层（静音提示、弹幕等）...")
         driver.execute_script("""
-            // 要隐藏的元素选择器列表（可根据需要增减）
-            const selectorsToHide = [
-                '.bpx-player-toast-wrap',          // "已静音开播 点击恢复音量" 提示
-                '.bpx-player-toast-row',            // 同上（备选选择器）
-                '.bpx-player-dm-wrap',              // 弹幕层
-                '.bpx-player-sending-bar',          // 底部弹幕发送栏
-                '.bpx-player-control-wrap',         // 播放器底部控制条
-                '.bpx-player-top-wrap',             // 播放器顶部标题栏
-                '.bpx-player-dialog-wrap',          // 各种弹窗/对话框
-                '.bpx-player-tooltip-area',         // 工具提示区域
-                '.bpx-player-state-wrap',           // 播放状态提示（暂停图标等）
+            const selectorsToHide =[
+                '.bpx-player-toast-wrap',
+                '.bpx-player-toast-row',
+                '.bpx-player-dm-wrap',
+                '.bpx-player-sending-bar',
+                '.bpx-player-control-wrap',
+                '.bpx-player-top-wrap',
+                '.bpx-player-dialog-wrap',
+                '.bpx-player-tooltip-area',
+                '.bpx-player-state-wrap',
             ];
             selectorsToHide.forEach(selector => {
                 document.querySelectorAll(selector).forEach(el => {
-                    el.style.display = 'none';
+                    if(el) el.style.display = 'none';
                 });
             });
         """)
-        # 等一小会儿让 DOM 变更生效
         time.sleep(0.5)
 
-        # 保存截图
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
         safe_title = re.sub(r'[\\/*?:"<>|]', "", video_title)
         save_path = os.path.join(SCREENSHOT_DIR, f"{safe_title}.png")
@@ -281,37 +265,38 @@ def take_video_screenshot(video_url: str, video_title: str):
 
     except Exception as e:
         print(f"截图过程中发生异常: {e}")
-    finally:
-        print("关闭浏览器。")
-        time.sleep(1)
-        driver.quit()
-
 
 # ======================== 主流程 ========================
 
 def main():
-    # 1. 通过 API 获取视频列表
-    videos = fetch_video_list(MID, SEASON_ID)
-    if not videos:
-        print("无法获取视频列表，程序终止。")
-        return
-
-    # 2. 正则匹配找到最新的目标视频
-    target = find_target_video(videos, TITLE_PATTERN)
-    if not target:
-        print("没有找到符合条件的视频，程序终止。")
-        return
-
-    # 3. 检查登录状态：首次运行需要手动登录一次
     if not is_logged_in():
         first_time_login()
         if not is_logged_in():
             print("未完成登录，程序终止。")
             return
 
-    # 4. 截图（已登录则自动使用后台静默模式）
-    take_video_screenshot(target["url"], target["title"])
+    use_headless = is_logged_in() and (not FORCE_SHOW_BROWSER)
+    if use_headless:
+        print("正在以后台静默模式启动 Chrome...")
+    else:
+        print("正在启动 Chrome 浏览器（窗口模式）...")
 
+    options = build_chrome_options(headless=use_headless)
+    service = Service(executable_path=CHROME_DRIVER_PATH)
+    driver = webdriver.Chrome(service=service, options=options)
+
+    try:
+        target = find_target_video(driver, MID, TITLE_PATTERN)
+        if not target:
+            print("没有找到符合条件的视频，程序终止。")
+            return
+
+        take_video_screenshot(driver, target["url"], target["title"])
+        
+    finally:
+        print("关闭浏览器。")
+        time.sleep(1)
+        driver.quit()
 
 if __name__ == "__main__":
     main()
